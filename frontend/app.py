@@ -25,10 +25,13 @@ if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
 
 if "use_rag" not in st.session_state:
-    st.session_state.use_rag = False
+    st.session_state.use_rag = None  # Now None by default to enable LLM-based routing
 
 if "documents" not in st.session_state:
     st.session_state.documents = []
+    
+if "last_routing_decision" not in st.session_state:
+    st.session_state.last_routing_decision = {}
 
 
 def display_messages():
@@ -73,7 +76,7 @@ def handle_submit():
     response = api.send_message(
         st.session_state.messages,
         st.session_state.conversation_id,
-        use_rag=st.session_state.use_rag
+        use_rag=st.session_state.use_rag  # Will be None if using LLM-based routing
     )
     
     # Update conversation ID
@@ -89,9 +92,19 @@ def handle_submit():
     st.session_state.messages.append({"role": "assistant", "content": response.get("response", "")})
 
 
-def toggle_rag():
-    """Toggle RAG functionality."""
-    st.session_state.use_rag = not st.session_state.use_rag
+def toggle_auto_rag():
+    """Toggle between auto, manual on, and manual off for RAG functionality."""
+    current = st.session_state.rag_mode
+    
+    if current == "auto":
+        st.session_state.use_rag = True
+        st.session_state.rag_mode = "on"
+    elif current == "on":
+        st.session_state.use_rag = False
+        st.session_state.rag_mode = "off"
+    else:  # "off"
+        st.session_state.use_rag = None
+        st.session_state.rag_mode = "auto"
 
 
 def main():
@@ -102,15 +115,24 @@ def main():
     Welcome to Boga Chat! A chatbot powered by LangChain, LangSmith, and LangGraph.
     """)
     
+    # Initialize RAG mode
+    if "rag_mode" not in st.session_state:
+        st.session_state.rag_mode = "auto"  # auto, on, off
+    
     # Chat container
     chat_container = st.container()
     
     with chat_container:
         display_messages()
         
-        # Display documents if RAG is enabled and documents are available
-        if st.session_state.use_rag:
+        # Display documents if available
+        if st.session_state.documents:
             display_documents()
+            
+        # Display routing decision if available
+        if st.session_state.last_routing_decision:
+            with st.expander("🧠 LLM Routing Decision", expanded=False):
+                st.json(st.session_state.last_routing_decision)
     
     # User input
     st.text_input(
@@ -133,12 +155,24 @@ def main():
         - 🗄️ Supabase
         """)
         
-        # RAG toggle
+        # RAG toggle with 3 modes
         st.markdown("### Settings")
-        rag_enabled = st.toggle("Enable Document Retrieval (RAG)", value=st.session_state.use_rag, key="rag_toggle", on_change=toggle_rag)
         
-        if rag_enabled:
-            st.info("Document retrieval is enabled. The chatbot will search for relevant documents to answer your questions.")
+        rag_mode = st.session_state.rag_mode
+        rag_emoji = "🤖" if rag_mode == "auto" else "✅" if rag_mode == "on" else "❌"
+        rag_label = f"{rag_emoji} Document Retrieval: {rag_mode.upper()}"
+        
+        if st.button(rag_label):
+            toggle_auto_rag()
+            st.rerun()
+        
+        # Explanation of RAG modes
+        if rag_mode == "auto":
+            st.info("AUTO mode: The AI decides when to use document retrieval based on your query.")
+        elif rag_mode == "on":
+            st.success("ON mode: Document retrieval is always enabled.")
+        else:  # "off"
+            st.error("OFF mode: Document retrieval is disabled.")
         
         st.markdown("---")
         
@@ -147,6 +181,7 @@ def main():
             st.session_state.messages = []
             st.session_state.conversation_id = None
             st.session_state.documents = []
+            st.session_state.last_routing_decision = {}
             st.rerun()
         
         # Show conversation ID

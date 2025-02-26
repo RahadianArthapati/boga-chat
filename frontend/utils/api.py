@@ -30,7 +30,7 @@ class ChatAPI:
         messages: List[Dict[str, str]], 
         conversation_id: Optional[str] = None,
         stream: bool = False,
-        use_rag: bool = False
+        use_rag: Optional[bool] = None  # Now optional to allow LLM-based routing
     ) -> Dict[str, Any]:
         """
         Send a message to the chat API.
@@ -39,21 +39,24 @@ class ChatAPI:
             messages: List of message dictionaries with 'role' and 'content'
             conversation_id: Optional conversation ID
             stream: Whether to stream the response
-            use_rag: Whether to use RAG (Retrieval Augmented Generation)
+            use_rag: Optional flag to force RAG usage. If None, the LLM will decide
             
         Returns:
-            Dict with response, conversation_id, and optional documents
+            Dict with response, conversation_id, optional documents, and routing info
         """
         try:
-            # Use the RAG endpoint if requested
-            url = f"{self.base_url}/api/chat/rag" if use_rag else f"{self.base_url}/api/chat/"
+            # Default endpoint for both RAG and non-RAG (router decides)
+            url = f"{self.base_url}/api/chat/"
             
             payload = {
                 "messages": messages,
                 "conversation_id": conversation_id,
-                "stream": stream,
-                "use_rag": use_rag
+                "stream": stream
             }
+            
+            # Only include use_rag if explicitly set
+            if use_rag is not None:
+                payload["use_rag"] = use_rag
             
             response = requests.post(
                 url, 
@@ -62,7 +65,11 @@ class ChatAPI:
             )
             
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                # Add routing info to the result
+                if "routing_decision" in result:
+                    st.session_state.last_routing_decision = result["routing_decision"]
+                return result
             else:
                 st.error(f"Error: {response.status_code} - {response.text}")
                 return {
@@ -82,7 +89,7 @@ class ChatAPI:
         messages: List[Dict[str, str]],
         conversation_id: Optional[str] = None,
         on_chunk: Callable[[str, str], None] = None,
-        use_rag: bool = False
+        use_rag: Optional[bool] = None
     ) -> Dict[str, Any]:
         """
         Stream a message from the chat API.
@@ -91,7 +98,7 @@ class ChatAPI:
             messages: List of message dictionaries with 'role' and 'content'
             conversation_id: Optional conversation ID
             on_chunk: Callback function to handle each chunk
-            use_rag: Whether to use RAG (Retrieval Augmented Generation)
+            use_rag: Optional flag to force RAG usage. If None, the LLM will decide
             
         Returns:
             Dict with full_response, conversation_id, and optional documents
@@ -102,8 +109,11 @@ class ChatAPI:
             payload = {
                 "messages": messages,
                 "conversation_id": conversation_id,
-                "use_rag": use_rag
             }
+            
+            # Only include use_rag if explicitly set
+            if use_rag is not None:
+                payload["use_rag"] = use_rag
             
             # Make a streaming request
             response = requests.post(
@@ -127,6 +137,7 @@ class ChatAPI:
             full_response = ""
             result_conversation_id = conversation_id
             documents = None
+            routing_decision = None
             
             for event in client.events():
                 if event.event == "chunk":
@@ -134,6 +145,7 @@ class ChatAPI:
                     chunk = data.get("chunk", "")
                     result_conversation_id = data.get("conversation_id", conversation_id)
                     documents = data.get("documents")
+                    routing_decision = data.get("routing_decision")
                     
                     # Update full response
                     full_response += chunk
@@ -147,12 +159,18 @@ class ChatAPI:
                     full_response = data.get("full_response", full_response)
                     result_conversation_id = data.get("conversation_id", result_conversation_id)
                     documents = data.get("documents", documents)
+                    routing_decision = data.get("routing_decision", routing_decision)
                     break
             
+            # Add routing decision to session state if available
+            if routing_decision:
+                st.session_state.last_routing_decision = routing_decision
+                
             return {
                 "full_response": full_response,
                 "conversation_id": result_conversation_id,
-                "documents": documents
+                "documents": documents,
+                "routing_decision": routing_decision
             }
                 
         except Exception as e:

@@ -17,14 +17,14 @@ from app.langchain.embeddings import search_documents
 logger = logging.getLogger(__name__)
 
 
-async def get_relevant_documents(query: str, limit: int = 3, threshold: float = 0.7) -> List[Dict[str, Any]]:
+async def get_relevant_documents(query: str, limit: int = 3, threshold: float = 0.45) -> List[Dict[str, Any]]:
     """
     Retrieve relevant documents for a query.
     
     Args:
         query: The search query
         limit: Maximum number of results to return
-        threshold: Minimum similarity threshold
+        threshold: Minimum similarity threshold (default lowered to 0.45 based on testing)
         
     Returns:
         List of relevant document chunks

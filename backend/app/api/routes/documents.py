@@ -40,7 +40,7 @@ class DocumentSearchRequest(BaseModel):
     """Document search request model."""
     query: str
     limit: int = 5
-    similarity_threshold: float = Field(0.7, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.45, ge=0.0, le=1.0)
     metadata_filter: Optional[Dict[str, Any]] = None
 
 

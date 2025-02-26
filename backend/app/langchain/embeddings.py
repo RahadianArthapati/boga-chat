@@ -118,7 +118,7 @@ async def store_document_embeddings(
 async def search_documents(
     query: str,
     limit: int = 5,
-    similarity_threshold: float = 0.7,
+    similarity_threshold: float = 0.45,
     metadata_filter: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -127,18 +127,22 @@ async def search_documents(
     Args:
         query: The search query
         limit: Maximum number of results to return
-        similarity_threshold: Minimum similarity score (0-1)
+        similarity_threshold: Minimum similarity score (0-1) - lowered to 0.45 based on testing
         metadata_filter: Optional filter for metadata fields
         
     Returns:
         List of matching documents with similarity scores
     """
     try:
+        logger.info(f"Starting document search with query: {query}, limit: {limit}, "
+                    f"similarity_threshold: {similarity_threshold}, metadata_filter: {metadata_filter}")
+        
         # Get embeddings model
         embeddings_model = get_embeddings_model()
         
         # Generate query embedding
         query_embedding = embeddings_model.embed_query(query)
+        logger.debug(f"Generated query embedding: {query_embedding}")
         
         # Get Supabase client
         supabase = get_supabase_client()
@@ -148,29 +152,36 @@ async def search_documents(
         response = supabase.table("document_embeddings") \
             .select("*") \
             .execute()
-            
+        
         if not response.data:
+            logger.info("No data found in document_embeddings table.")
             return []
-            
+        
+        logger.info(f"Retrieved {len(response.data)} documents from the database.")
+        
         # Calculate similarity manually
         results = []
         for item in response.data:
             # Skip items without embeddings
             if not item.get("embedding"):
+                logger.debug(f"Skipping item with missing embedding: {item}")
                 continue
                 
             # Calculate cosine similarity
             embedding = item["embedding"]
             similarity = 1 - cosine_distance(query_embedding, embedding)
+            logger.debug(f"Calculated similarity: {similarity} for document_id: {item['document_id']}")
             
             # Apply similarity threshold
             if similarity < similarity_threshold:
+                logger.debug(f"Document {item['document_id']} below similarity threshold: {similarity}")
                 continue
                 
             # Apply metadata filter if provided
             if metadata_filter:
                 item_metadata = item.get("metadata", {})
                 if not all(item_metadata.get(k) == v for k, v in metadata_filter.items()):
+                    logger.debug(f"Document {item['document_id']} does not match metadata filter: {metadata_filter}")
                     continue
             
             # Add to results
@@ -185,7 +196,8 @@ async def search_documents(
         # Sort by similarity and limit results
         results.sort(key=lambda x: x["similarity"], reverse=True)
         results = results[:limit]
-            
+        
+        logger.info(f"Returning {len(results)} results after sorting and limiting.")
         return results
         
     except Exception as e:

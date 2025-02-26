@@ -4,6 +4,7 @@ Chat API endpoints for Boga Chat.
 from typing import Dict, List, Optional, Any
 import logging
 import json
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -12,7 +13,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.langchain.chains import get_chat_chain, get_streaming_chat_chain
 from app.langchain.rag import process_with_rag, stream_with_rag
+from app.langchain.simple_chat import process_chat, stream_chat as simple_stream_chat
 from app.db.supabase import get_supabase_client
+from app.langchain.router import should_use_rag
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -29,7 +32,7 @@ class ChatRequest(BaseModel):
     messages: List[ChatMessage]
     conversation_id: Optional[str] = None
     stream: bool = False
-    use_rag: bool = False
+    use_rag: Optional[bool] = None  # Now optional, will be determined by LLM if not provided
 
 
 class ChatResponse(BaseModel):
@@ -37,6 +40,8 @@ class ChatResponse(BaseModel):
     response: str
     conversation_id: str
     documents: Optional[List[Dict[str, Any]]] = None
+    use_rag: Optional[bool] = None  # Added to show if RAG was used
+    routing_decision: Optional[Dict[str, Any]] = None  # Added to show routing logic
 
 
 class StreamingChatResponse(BaseModel):
@@ -73,41 +78,28 @@ async def chat(
             for msg in request.messages
         ]
         
-        # Process the chat request with or without RAG
-        if request.use_rag:
-            logger.info(f"Processing RAG chat request with {len(formatted_messages)} messages")
-            result = await process_with_rag(
-                messages=formatted_messages,
-                conversation_id=request.conversation_id
-            )
-            documents = result.get("documents", [])
-        else:
-            # Get the chat chain
-            chat_chain = get_chat_chain()
-            
-            logger.info(f"Processing standard chat request with {len(formatted_messages)} messages")
-            result = chat_chain({
-                "messages": formatted_messages,
-                "conversation_id": request.conversation_id
-            })
-            documents = None
-            
+        # Use the new simplified chat processing
+        logger.info(f"Processing chat request with {len(formatted_messages)} messages")
+        result = await process_chat(
+            messages=formatted_messages,
+            conversation_id=request.conversation_id,
+            use_rag=request.use_rag
+        )
+        
         logger.info(f"Chat result: {result}")
         
-        # Get conversation ID from request or result
-        conversation_id = request.conversation_id or result.get("conversation_id")
-        
-        # No need to save to Supabase conversations table
-        
+        # Return the response with routing information
         return ChatResponse(
-            response=result["response"],
-            conversation_id=conversation_id,
-            documents=documents
+            response=result.get("response", ""),
+            conversation_id=result.get("conversation_id"),
+            documents=result.get("documents"),
+            use_rag=result.get("use_rag"),
+            routing_decision=result.get("routing_decision")
         )
     
     except Exception as e:
-        logger.error(f"Chat processing error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Chat processing error: {str(e)}")
+        logger.error(f"Error processing chat request: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/stream")
@@ -131,84 +123,22 @@ async def stream_chat(
             for msg in request.messages
         ]
         
-        logger.info(f"Processing streaming chat request with {len(formatted_messages)} messages")
+        logger.info(f"Streaming chat request with {len(formatted_messages)} messages")
         
+        # Use the streaming function from simple_chat
         async def event_generator():
-            full_response = ""
-            conversation_id = request.conversation_id
-            documents = None
-            
-            try:
-                if request.use_rag:
-                    # Use RAG streaming
-                    async for chunk_data in stream_with_rag(
-                        messages=formatted_messages,
-                        conversation_id=conversation_id
-                    ):
-                        chunk = chunk_data["chunk"]
-                        full_response = chunk_data["full_response"]
-                        conversation_id = chunk_data["conversation_id"]
-                        documents = chunk_data.get("documents")
-                        
-                        # Yield the chunk as a server-sent event
-                        yield {
-                            "event": "chunk",
-                            "data": json.dumps({
-                                "chunk": chunk,
-                                "conversation_id": conversation_id,
-                                "documents": documents,
-                                "done": False
-                            })
-                        }
-                else:
-                    # Use standard streaming
-                    async for chunk_data in get_streaming_chat_chain(
-                        messages=formatted_messages,
-                        conversation_id=conversation_id
-                    ):
-                        chunk = chunk_data["chunk"]
-                        full_response = chunk_data["full_response"]
-                        conversation_id = chunk_data["conversation_id"]
-                        
-                        # Yield the chunk as a server-sent event
-                        yield {
-                            "event": "chunk",
-                            "data": json.dumps({
-                                "chunk": chunk,
-                                "conversation_id": conversation_id,
-                                "documents": None,
-                                "done": False
-                            })
-                        }
-                
-                # Final chunk with done=True
-                yield {
-                    "event": "done",
-                    "data": json.dumps({
-                        "full_response": full_response,
-                        "conversation_id": conversation_id,
-                        "documents": documents,
-                        "done": True
-                    })
-                }
-                
-            except Exception as e:
-                logger.error(f"Streaming error: {str(e)}", exc_info=True)
-                yield {
-                    "event": "done",
-                    "data": json.dumps({
-                        "full_response": full_response + f"\n\nError: {str(e)}",
-                        "conversation_id": conversation_id,
-                        "documents": documents,
-                        "done": True
-                    })
-                }
+            async for event in simple_stream_chat(
+                messages=formatted_messages,
+                conversation_id=request.conversation_id,
+                use_rag=request.use_rag
+            ):
+                yield event
         
         return EventSourceResponse(event_generator())
     
     except Exception as e:
-        logger.error(f"Streaming chat processing error: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Streaming chat processing error: {str(e)}")
+        logger.error(f"Error streaming chat: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/rag", response_model=ChatResponse)
@@ -238,16 +168,17 @@ async def get_conversation(
     """
     Get a conversation by ID.
     
+    Note: Conversation history is not currently being stored in the database.
+    This endpoint is a placeholder for future functionality.
+    
     Args:
         conversation_id: The ID of the conversation to retrieve
         
     Returns:
         List[ChatMessage]: The messages in the conversation
     """
-    try:
-        # Since we're not using the conversations table, return an empty list or error
-        # This endpoint can be modified later if conversation persistence is needed
-        raise HTTPException(status_code=404, detail="Conversation history not available")
-    except Exception as e:
-        logger.error(f"Error retrieving conversation: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error retrieving conversation: {str(e)}") 
+    # Return a clear message that conversations are not being stored
+    raise HTTPException(
+        status_code=404, 
+        detail="Conversation history is not being stored. The application is currently configured to use only document embeddings in Supabase."
+    ) 
