@@ -35,9 +35,10 @@ def generate_response(state: ChatState) -> ChatState:
     """
     # Get the chat model
     model = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-4o-mini",
         temperature=0.7,
-        api_key=settings.OPENAI_API_KEY
+        api_key=settings.OPENAI_API_KEY,
+        streaming=True
     )
     
     # Format messages for the model

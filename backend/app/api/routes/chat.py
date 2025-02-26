@@ -1,13 +1,17 @@
 """
 Chat API endpoints for Boga Chat.
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import logging
+import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
-from app.langchain.chains import get_chat_chain
+from app.langchain.chains import get_chat_chain, get_streaming_chat_chain
+from app.langchain.rag import process_with_rag, stream_with_rag
 from app.db.supabase import get_supabase_client
 
 router = APIRouter()
@@ -24,12 +28,24 @@ class ChatRequest(BaseModel):
     """Chat request model."""
     messages: List[ChatMessage]
     conversation_id: Optional[str] = None
+    stream: bool = False
+    use_rag: bool = False
 
 
 class ChatResponse(BaseModel):
     """Chat response model."""
     response: str
     conversation_id: str
+    documents: Optional[List[Dict[str, Any]]] = None
+
+
+class StreamingChatResponse(BaseModel):
+    """Streaming chat response model."""
+    chunk: str
+    full_response: Optional[str] = None
+    conversation_id: str
+    documents: Optional[List[Dict[str, Any]]] = None
+    done: bool = False
 
 
 @router.post("/", response_model=ChatResponse)
@@ -46,47 +62,172 @@ async def chat(
     Returns:
         ChatResponse: The assistant's response and conversation ID
     """
+    # If streaming is requested, use the streaming endpoint
+    if request.stream:
+        return await stream_chat(request, supabase)
+    
     try:
-        # Get the chat chain
-        chat_chain = get_chat_chain()
-        
         # Format messages for the chain
         formatted_messages = [
             {"role": msg.role, "content": msg.content}
             for msg in request.messages
         ]
         
-        # Process the chat request
-        logger.info(f"Processing chat request with {len(formatted_messages)} messages")
-        result = chat_chain({
-            "messages": formatted_messages,
-            "conversation_id": request.conversation_id
-        })
-        logger.info(f"Chat chain result: {result}")
+        # Process the chat request with or without RAG
+        if request.use_rag:
+            logger.info(f"Processing RAG chat request with {len(formatted_messages)} messages")
+            result = await process_with_rag(
+                messages=formatted_messages,
+                conversation_id=request.conversation_id
+            )
+            documents = result.get("documents", [])
+        else:
+            # Get the chat chain
+            chat_chain = get_chat_chain()
+            
+            logger.info(f"Processing standard chat request with {len(formatted_messages)} messages")
+            result = chat_chain({
+                "messages": formatted_messages,
+                "conversation_id": request.conversation_id
+            })
+            documents = None
+            
+        logger.info(f"Chat result: {result}")
         
-        # Store conversation in Supabase if needed
+        # Get conversation ID from request or result
         conversation_id = request.conversation_id or result.get("conversation_id")
         
-        # Try to save to Supabase, but continue even if it fails
-        if conversation_id:
-            try:
-                supabase.table("conversations").upsert({
-                    "id": conversation_id,
-                    "messages": formatted_messages + [{"role": "assistant", "content": result["response"]}]
-                }).execute()
-                logger.info(f"Saved conversation {conversation_id} to Supabase")
-            except Exception as e:
-                logger.warning(f"Failed to save conversation to Supabase: {str(e)}")
-                # Continue without saving to Supabase
+        # No need to save to Supabase conversations table
         
         return ChatResponse(
             response=result["response"],
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            documents=documents
         )
     
     except Exception as e:
         logger.error(f"Chat processing error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Chat processing error: {str(e)}")
+
+
+@router.post("/stream")
+async def stream_chat(
+    request: ChatRequest,
+    supabase = Depends(get_supabase_client)
+):
+    """
+    Process a chat request and stream the response.
+    
+    Args:
+        request: The chat request containing messages and optional conversation_id
+        
+    Returns:
+        StreamingResponse: A streaming response with the assistant's response
+    """
+    try:
+        # Format messages for the chain
+        formatted_messages = [
+            {"role": msg.role, "content": msg.content}
+            for msg in request.messages
+        ]
+        
+        logger.info(f"Processing streaming chat request with {len(formatted_messages)} messages")
+        
+        async def event_generator():
+            full_response = ""
+            conversation_id = request.conversation_id
+            documents = None
+            
+            try:
+                if request.use_rag:
+                    # Use RAG streaming
+                    async for chunk_data in stream_with_rag(
+                        messages=formatted_messages,
+                        conversation_id=conversation_id
+                    ):
+                        chunk = chunk_data["chunk"]
+                        full_response = chunk_data["full_response"]
+                        conversation_id = chunk_data["conversation_id"]
+                        documents = chunk_data.get("documents")
+                        
+                        # Yield the chunk as a server-sent event
+                        yield {
+                            "event": "chunk",
+                            "data": json.dumps({
+                                "chunk": chunk,
+                                "conversation_id": conversation_id,
+                                "documents": documents,
+                                "done": False
+                            })
+                        }
+                else:
+                    # Use standard streaming
+                    async for chunk_data in get_streaming_chat_chain(
+                        messages=formatted_messages,
+                        conversation_id=conversation_id
+                    ):
+                        chunk = chunk_data["chunk"]
+                        full_response = chunk_data["full_response"]
+                        conversation_id = chunk_data["conversation_id"]
+                        
+                        # Yield the chunk as a server-sent event
+                        yield {
+                            "event": "chunk",
+                            "data": json.dumps({
+                                "chunk": chunk,
+                                "conversation_id": conversation_id,
+                                "documents": None,
+                                "done": False
+                            })
+                        }
+                
+                # Final chunk with done=True
+                yield {
+                    "event": "done",
+                    "data": json.dumps({
+                        "full_response": full_response,
+                        "conversation_id": conversation_id,
+                        "documents": documents,
+                        "done": True
+                    })
+                }
+                
+            except Exception as e:
+                logger.error(f"Streaming error: {str(e)}", exc_info=True)
+                yield {
+                    "event": "done",
+                    "data": json.dumps({
+                        "full_response": full_response + f"\n\nError: {str(e)}",
+                        "conversation_id": conversation_id,
+                        "documents": documents,
+                        "done": True
+                    })
+                }
+        
+        return EventSourceResponse(event_generator())
+    
+    except Exception as e:
+        logger.error(f"Streaming chat processing error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Streaming chat processing error: {str(e)}")
+
+
+@router.post("/rag", response_model=ChatResponse)
+async def rag_chat(
+    request: ChatRequest,
+    supabase = Depends(get_supabase_client)
+):
+    """
+    Process a chat request with RAG and return a response.
+    
+    Args:
+        request: The chat request containing messages and optional conversation_id
+        
+    Returns:
+        ChatResponse: The assistant's response, conversation ID, and relevant documents
+    """
+    # Set use_rag to True and delegate to the main chat endpoint
+    request.use_rag = True
+    return await chat(request, supabase)
 
 
 @router.get("/conversations/{conversation_id}", response_model=List[ChatMessage])
@@ -95,7 +236,7 @@ async def get_conversation(
     supabase = Depends(get_supabase_client)
 ):
     """
-    Retrieve a conversation by ID.
+    Get a conversation by ID.
     
     Args:
         conversation_id: The ID of the conversation to retrieve
@@ -104,18 +245,9 @@ async def get_conversation(
         List[ChatMessage]: The messages in the conversation
     """
     try:
-        try:
-            response = supabase.table("conversations").select("messages").eq("id", conversation_id).execute()
-            
-            if not response.data:
-                raise HTTPException(status_code=404, detail="Conversation not found")
-            
-            return [ChatMessage(**msg) for msg in response.data[0]["messages"]]
-        except Exception as e:
-            logger.warning(f"Failed to retrieve conversation from Supabase: {str(e)}")
-            raise HTTPException(status_code=404, detail="Conversation not found or database error")
-    
+        # Since we're not using the conversations table, return an empty list or error
+        # This endpoint can be modified later if conversation persistence is needed
+        raise HTTPException(status_code=404, detail="Conversation history not available")
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
+        logger.error(f"Error retrieving conversation: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error retrieving conversation: {str(e)}") 

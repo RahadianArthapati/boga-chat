@@ -24,6 +24,12 @@ if "messages" not in st.session_state:
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
 
+if "use_rag" not in st.session_state:
+    st.session_state.use_rag = False
+
+if "documents" not in st.session_state:
+    st.session_state.documents = []
+
 
 def display_messages():
     """Display all messages in the chat."""
@@ -32,6 +38,21 @@ def display_messages():
             message(msg["content"], is_user=True, key=f"user_{i}")
         else:
             message(msg["content"], is_user=False, key=f"assistant_{i}")
+
+
+def display_documents():
+    """Display retrieved documents if available."""
+    if st.session_state.documents and len(st.session_state.documents) > 0:
+        with st.expander("📚 Retrieved Documents", expanded=False):
+            for i, doc in enumerate(st.session_state.documents):
+                metadata = doc.get("metadata", {})
+                title = metadata.get("title", "Untitled Document")
+                source = metadata.get("source", "Unknown Source")
+                similarity = doc.get("similarity", 0)
+                
+                st.markdown(f"**Document {i+1}**: {title} (Source: {source}) - Similarity: {similarity:.2f}")
+                st.text_area(f"Content {i+1}", doc["chunk_text"], height=150, key=f"doc_{i}")
+                st.markdown("---")
 
 
 def handle_submit():
@@ -48,17 +69,29 @@ def handle_submit():
     st.session_state.user_input = ""
     
     # Call API
-    api = ChatAPI(base_url="http://localhost:8080")
+    api = ChatAPI(base_url="http://localhost:8000")
     response = api.send_message(
         st.session_state.messages,
-        st.session_state.conversation_id
+        st.session_state.conversation_id,
+        use_rag=st.session_state.use_rag
     )
     
     # Update conversation ID
     st.session_state.conversation_id = response.get("conversation_id")
     
+    # Update documents if available
+    if "documents" in response and response["documents"]:
+        st.session_state.documents = response["documents"]
+    else:
+        st.session_state.documents = []
+    
     # Add assistant response to session state
     st.session_state.messages.append({"role": "assistant", "content": response.get("response", "")})
+
+
+def toggle_rag():
+    """Toggle RAG functionality."""
+    st.session_state.use_rag = not st.session_state.use_rag
 
 
 def main():
@@ -74,6 +107,10 @@ def main():
     
     with chat_container:
         display_messages()
+        
+        # Display documents if RAG is enabled and documents are available
+        if st.session_state.use_rag:
+            display_documents()
     
     # User input
     st.text_input(
@@ -96,10 +133,20 @@ def main():
         - 🗄️ Supabase
         """)
         
+        # RAG toggle
+        st.markdown("### Settings")
+        rag_enabled = st.toggle("Enable Document Retrieval (RAG)", value=st.session_state.use_rag, key="rag_toggle", on_change=toggle_rag)
+        
+        if rag_enabled:
+            st.info("Document retrieval is enabled. The chatbot will search for relevant documents to answer your questions.")
+        
+        st.markdown("---")
+        
         # New conversation button
         if st.button("New Conversation"):
             st.session_state.messages = []
             st.session_state.conversation_id = None
+            st.session_state.documents = []
             st.rerun()
         
         # Show conversation ID
@@ -109,6 +156,12 @@ def main():
                 value=st.session_state.conversation_id,
                 disabled=True
             )
+            
+        st.markdown("---")
+        
+        # Link to Documents page
+        if st.button("Go to Documents"):
+            st.switch_page("pages/documents.py")
 
 
 if __name__ == "__main__":
